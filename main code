@@ -1,0 +1,1459 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SPI.h>
+#include "FS.h"
+#include "SD.h"
+#include <Fonts/TomThumb.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <time.h>
+#include <esp_sleep.h>
+#include <ArduinoOTA.h>
+
+// ================= FIX FOR ESP_EXT1_WAKEUP_ANY_LOW =================
+#ifndef ESP_EXT1_WAKEUP_ANY_LOW
+#define ESP_EXT1_WAKEUP_ANY_LOW ESP_EXT1_WAKEUP_ALL_LOW
+#endif
+
+// ================= DISPLAY CONFIGURATION =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define SDA_PIN 4
+#define SCL_PIN 5
+#define SD_CS 13
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+#define OLED_POWER_PIN 2
+
+// ================= BUTTON CONFIGURATION =================
+#define BTN_UP     26
+#define BTN_DOWN   33
+#define BTN_SELECT 32
+#define BTN_BACK   25
+
+// ================= SD CARD PINS =================
+#define SD_SCK 14
+#define SD_MOSI 15
+#define SD_MISO 2
+
+// ================= WiFi & TIME CONFIGURATION =================
+const char* ap_ssid = "FPV_CAM";
+const char* ap_password = "";
+const char* wifi_ssid = "FPV_CAM";
+const char* wifi_password = "12345678";
+const long gmtOffset_sec = 19800;
+const int daylightOffset_sec = 0;
+const char* ntpServer = "pool.ntp.org";
+
+// ================= SLEEP CONFIGURATION =================
+#define WATCH_SLEEP_TIMEOUT_MS 10000
+#define WAKEUP_BUTTON_MASK ((1ULL << BTN_SELECT))
+
+// ================= SYSTEM CONSTANTS =================
+#define MAX_CHAPTERS 5
+#define MAX_TOPICS 10
+#define MAX_LINES 500
+#define DEBOUNCE_DELAY 200
+#define LINES_PER_SCREEN 8
+#define VISIBLE_ITEMS 5
+
+// ================= RTC MEMORY =================
+RTC_DATA_ATTR int rtc_lastChapter = 0;
+RTC_DATA_ATTR int rtc_lastTopic = 0;
+RTC_DATA_ATTR int rtc_lastScrollPos = 0;
+RTC_DATA_ATTR bool rtc_hasResumeData = false;
+RTC_DATA_ATTR int rtc_hours = 0;
+RTC_DATA_ATTR int rtc_minutes = 0;
+RTC_DATA_ATTR int rtc_seconds = 0;
+RTC_DATA_ATTR int rtc_day = 1;
+RTC_DATA_ATTR int rtc_month = 1;
+RTC_DATA_ATTR int rtc_year = 2024;
+RTC_DATA_ATTR int rtc_weekDay = 1;
+RTC_DATA_ATTR unsigned long rtc_bootCount = 0;
+RTC_DATA_ATTR bool rtc_timeInitialized = false;
+
+// ================= SYSTEM VARIABLES =================
+enum Mode { MODE_WATCH, MODE_READER, MODE_AP, MODE_SETTINGS };
+Mode currentMode = MODE_WATCH;
+
+enum ScreenID { SCR_READER_MAIN, SCR_READER_CHAPTERS, SCR_READER_TOPICS, SCR_READER_READ };
+ScreenID readerScreen = SCR_READER_MAIN;
+
+int readerCursor = 0;
+int readerScrollTop = 0;
+int selectedChapter = 0;
+int selectedTopic = 0;
+int scrollPosition = 0;
+
+String chapters[MAX_CHAPTERS];
+int chapterCount = 0;
+String topics[MAX_TOPICS];
+int topicCount = 0;
+String currentFolder = "";
+String currentChapterName = "";
+String textLines[MAX_LINES];
+int lineCount = 0;
+
+int brightness = 255;
+int brightnessLevel = 100;
+
+bool timeSynced = false;
+int hours = 0, minutes = 0, seconds = 0;
+int day = 1, month = 1, year = 2024;
+int weekDay = 1;
+
+bool apEnabled = false;
+WebServer server(80);
+
+unsigned long lastButtonTime = 0;
+unsigned long lastActivityTime = 0;
+bool readerModeActive = false;
+bool firstBoot = true;
+bool sdCardMounted = false;
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ================= FUNCTION PROTOTYPES =================
+void oledPowerOn();
+void oledPowerOff();
+void setupAPMode();
+void stopAPMode();
+void setupWebServer();
+void handleWebRequests();
+void setupOTA();
+void softwareReset();
+void loadChapters();
+void loadTopics(String folder);
+void loadTopicContent(String folder, int topicIndex);
+void handleButtons();
+void displayReaderMenu();
+void displayChapters();
+void displayTopics();
+void displayText();
+void displayAPMain();
+void displaySettingsMain();
+void displayWatchFace();
+void setBrightness(int level);
+void syncTimeWithNTP();
+void updateInternalRTC();
+void loadRTC();
+void saveRTC();
+void goToDeepSleep();
+void createDefaultStructure();
+String readChapterName(int ch);
+String readTopicName(int ch, int topic);
+String readTopicContent(int ch, int topic);
+bool saveTopicContent(int ch, int topic, String content);
+bool renameChapter(int ch, String newName);
+bool renameTopic(int ch, int topic, String newName);
+void showPopup(const char* message, int duration = 1000);
+void showMessage(String l1, String l2 = "", String l3 = "");
+void connectWiFiAndSync();
+void exitToWatchMode();
+void enterReaderMode();
+void saveReadingProgress();
+void loadReadingProgress();
+String getWeekDayString(int wd);
+void resetActivityTimer();
+void initDisplay();
+bool initSDCard();
+
+// ================= SOFTWARE RESET FUNCTION =================
+void softwareReset() {
+  Serial.println("Software resetting ESP32...");
+  display.clearDisplay();
+  display.setCursor(20, 20);
+  display.println("Resetting...");
+  display.display();
+  delay(1000);
+  ESP.restart();
+}
+
+// ================= SD CARD INITIALIZATION =================
+bool initSDCard() {
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  
+  if (!SD.begin(SD_CS, SPI, 4000000)) {
+    if (!SD.begin(SD_CS, SPI, 1000000)) {
+      if (!SD.begin(SD_CS, SPI, 400000)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// ================= DISPLAY INIT =================
+void initDisplay() {
+  Wire.begin(SDA_PIN, SCL_PIN);
+  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  display.setRotation(2);
+  display.setTextColor(WHITE);
+  display.clearDisplay();
+  setBrightness(brightness);
+}
+
+// ================= OLED POWER CONTROL =================
+void oledPowerOn() {
+  pinMode(OLED_POWER_PIN, OUTPUT);
+  digitalWrite(OLED_POWER_PIN, HIGH);
+  delay(50);
+  initDisplay();
+}
+
+void oledPowerOff() {
+  display.clearDisplay();
+  display.display();
+  delay(50);
+  digitalWrite(OLED_POWER_PIN, LOW);
+  pinMode(OLED_POWER_PIN, INPUT);
+}
+
+// ================= ACTIVITY TIMER =================
+void resetActivityTimer() {
+  lastActivityTime = millis();
+}
+
+// ================= READING PROGRESS =================
+void saveReadingProgress() {
+  rtc_lastChapter = selectedChapter;
+  rtc_lastTopic = selectedTopic;
+  rtc_lastScrollPos = scrollPosition;
+  rtc_hasResumeData = true;
+}
+
+void loadReadingProgress() {
+  if (rtc_hasResumeData) {
+    selectedChapter = rtc_lastChapter;
+    selectedTopic = rtc_lastTopic;
+    scrollPosition = rtc_lastScrollPos;
+  }
+}
+
+void enterReaderMode() {
+  if(!sdCardMounted){
+    showPopup("No SD Card!", 1500);
+    return;
+  }
+  
+  readerModeActive = true;
+  currentMode = MODE_READER;
+  resetActivityTimer();
+  
+  if (rtc_hasResumeData && rtc_lastChapter < chapterCount && rtc_lastTopic < 10) {
+    selectedChapter = rtc_lastChapter;
+    currentFolder = "ch" + String(selectedChapter + 1);
+    currentChapterName = chapters[selectedChapter];
+    loadTopics(currentFolder);
+    
+    selectedTopic = rtc_lastTopic;
+    loadTopicContent(currentFolder, selectedTopic);
+    scrollPosition = rtc_lastScrollPos;
+    
+    readerScreen = SCR_READER_READ;
+    showPopup("Resuming Reading", 1000);
+  } else {
+    readerScreen = SCR_READER_MAIN;
+    readerCursor = 0;
+    selectedChapter = 0;
+    selectedTopic = 0;
+    scrollPosition = 0;
+    showPopup("Entering Reader", 1000);
+  }
+  displayReaderMenu();
+}
+
+void exitToWatchMode() {
+  if (currentMode == MODE_READER && readerScreen == SCR_READER_READ) {
+    saveReadingProgress();
+  }
+  currentMode = MODE_WATCH;
+  readerModeActive = false;
+  readerScreen = SCR_READER_MAIN;
+  readerCursor = 0;
+  selectedChapter = 0;
+  selectedTopic = 0;
+  scrollPosition = 0;
+  if(apEnabled) stopAPMode();
+  resetActivityTimer();
+  displayWatchFace();
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  rtc_bootCount++;
+  Serial.println("Boot #" + String(rtc_bootCount));
+  
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
+  pinMode(BTN_BACK, INPUT_PULLUP);
+  
+  oledPowerOn();
+  loadRTC();
+  
+  // Show boot screen
+  display.clearDisplay();
+  display.setCursor(20, 20);
+  display.println("Initializing...");
+  display.display();
+  delay(500);
+  
+  // Initialize SD card
+  display.clearDisplay();
+  display.setCursor(20, 20);
+  display.println("SD Card...");
+  display.display();
+  
+  sdCardMounted = initSDCard();
+  
+  if (sdCardMounted) {
+    display.clearDisplay();
+    display.setCursor(20, 20);
+    display.println("SD Ready!");
+    display.display();
+    delay(500);
+    
+    if(!SD.exists("/index.txt")) {
+      createDefaultStructure();
+    }
+    loadChapters();
+  } else {
+    display.clearDisplay();
+    display.setCursor(15, 20);
+    display.println("No SD Card!");
+    display.setCursor(15, 35);
+    display.println("Watch Only");
+    display.display();
+    delay(1500);
+  }
+  
+  // Time sync
+  if (!rtc_timeInitialized || rtc_bootCount == 1) {
+    connectWiFiAndSync();
+  } else {
+    hours = rtc_hours;
+    minutes = rtc_minutes;
+    seconds = rtc_seconds;
+    day = rtc_day;
+    month = rtc_month;
+    year = rtc_year;
+    weekDay = rtc_weekDay;
+    timeSynced = true;
+  }
+  
+  setBrightness(brightness);
+  resetActivityTimer();
+  displayWatchFace();
+  firstBoot = false;
+}
+
+// ================= RTC FUNCTIONS =================
+void loadRTC() {
+  if (rtc_timeInitialized) {
+    hours = rtc_hours;
+    minutes = rtc_minutes;
+    seconds = rtc_seconds;
+    day = rtc_day;
+    month = rtc_month;
+    year = rtc_year;
+    weekDay = rtc_weekDay;
+  }
+}
+
+void saveRTC() {
+  rtc_hours = hours;
+  rtc_minutes = minutes;
+  rtc_seconds = seconds;
+  rtc_day = day;
+  rtc_month = month;
+  rtc_year = year;
+  rtc_weekDay = weekDay;
+  rtc_timeInitialized = true;
+}
+
+void updateInternalRTC() {
+  static unsigned long lastUpdate = 0;
+  if (millis() - lastUpdate >= 1000) {
+    seconds++;
+    if (seconds >= 60) {
+      seconds = 0;
+      minutes++;
+      if (minutes >= 60) {
+        minutes = 0;
+        hours++;
+        if (hours >= 24) {
+          hours = 0;
+          day++;
+          weekDay = (weekDay + 1) % 7;
+          if (day > 31) {
+            day = 1;
+            month++;
+            if (month > 12) {
+              month = 1;
+              year++;
+            }
+          }
+        }
+      }
+    }
+    lastUpdate = millis();
+    saveRTC();
+  }
+}
+
+// ================= DEEP SLEEP =================
+void goToDeepSleep() {
+  Serial.println("Going to deep sleep...");
+  
+  if (currentMode == MODE_READER && readerScreen == SCR_READER_READ) {
+    saveReadingProgress();
+  }
+  saveRTC();
+  oledPowerOff();
+  
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_SELECT, 0);
+  
+  Serial.println("Sleeping... Wake on SELECT button");
+  esp_deep_sleep_start();
+}
+
+// ================= TIME FUNCTIONS =================
+void connectWiFiAndSync() {
+  display.clearDisplay();
+  display.setCursor(10, 20);
+  display.println("Connecting to");
+  display.setCursor(10, 35);
+  display.println("FPV_CAM...");
+  display.display();
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid, wifi_password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    display.clearDisplay();
+    display.setCursor(10, 20);
+    display.println("Syncing Time...");
+    display.display();
+    
+    syncTimeWithNTP();
+    
+    if (timeSynced) {
+      display.clearDisplay();
+      display.setCursor(25, 28);
+      display.println("Time Set!");
+      display.display();
+      delay(1000);
+    } else {
+      display.clearDisplay();
+      display.setCursor(20, 28);
+      display.println("Sync Failed");
+      display.display();
+      delay(1000);
+    }
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  } else {
+    display.clearDisplay();
+    display.setCursor(20, 28);
+    display.println("No WiFi");
+    display.display();
+    delay(1500);
+  }
+}
+
+void syncTimeWithNTP() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  struct tm timeinfo;
+  int attempts = 0;
+  
+  while (!getLocalTime(&timeinfo) && attempts < 10) {
+    delay(500);
+    attempts++;
+  }
+  
+  if (attempts < 10) {
+    hours = timeinfo.tm_hour;
+    minutes = timeinfo.tm_min;
+    seconds = timeinfo.tm_sec;
+    day = timeinfo.tm_mday;
+    month = timeinfo.tm_mon + 1;
+    year = timeinfo.tm_year + 1900;
+    weekDay = timeinfo.tm_wday;
+    timeSynced = true;
+    saveRTC();
+  } else {
+    timeSynced = false;
+  }
+}
+
+String getWeekDayString(int wd) {
+  switch(wd) {
+    case 0: return "SUN";
+    case 1: return "MON";
+    case 2: return "TUE";
+    case 3: return "WED";
+    case 4: return "THU";
+    case 5: return "FRI";
+    case 6: return "SAT";
+    default: return "MON";
+  }
+}
+
+// ================= UTILITY FUNCTIONS =================
+void showPopup(const char* message, int duration) {
+  display.clearDisplay();
+  display.setCursor(10, 30);
+  display.print(message);
+  display.display();
+  delay(duration);
+  if(currentMode == MODE_WATCH) displayWatchFace();
+  else displayReaderMenu();
+  resetActivityTimer();
+}
+
+void showMessage(String l1, String l2, String l3) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  if(l1 != "") display.println(l1);
+  if(l2 != "") display.println(l2);
+  if(l3 != "") display.println(l3);
+  display.display();
+  resetActivityTimer();
+}
+
+void setBrightness(int level) {
+  level = map(level, 0, 255, 0, 255);
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(level);
+}
+
+// ================= DEFAULT STRUCTURE =================
+void createDefaultStructure() {
+  showMessage("Creating files...", "", "");
+  
+  String defaultChapters[MAX_CHAPTERS] = {
+    "Chapter 1",
+    "Chapter 2", 
+    "Chapter 3",
+    "Chapter 4",
+    "Chapter 5"
+  };
+  
+  File index = SD.open("/index.txt", FILE_WRITE);
+  for(int i = 0; i < MAX_CHAPTERS; i++) {
+    index.println(defaultChapters[i]);
+  }
+  index.close();
+  
+  for(int ch = 1; ch <= MAX_CHAPTERS; ch++) {
+    String folder = "/ch" + String(ch);
+    SD.mkdir(folder);
+    
+    File topicIndex = SD.open(folder + "/index.txt", FILE_WRITE);
+    for(int t = 1; t <= MAX_TOPICS; t++) {
+      topicIndex.println("Topic " + String(t));
+    }
+    topicIndex.close();
+    
+    for(int t = 1; t <= MAX_TOPICS; t++) {
+      File topic = SD.open(folder + "/topic" + String(t) + ".txt", FILE_WRITE);
+      topic.println("Content for " + defaultChapters[ch-1] + " - Topic " + String(t));
+      topic.println("\nEdit me via WiFi!");
+      topic.close();
+    }
+  }
+  delay(1000);
+}
+
+// ================= FILE LOADING =================
+void loadChapters() {
+  File f = SD.open("/index.txt");
+  chapterCount = 0;
+  if(!f) return;
+  
+  while(f.available() && chapterCount < MAX_CHAPTERS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if(line.length() > 0) chapters[chapterCount++] = line;
+  }
+  f.close();
+}
+
+void loadTopics(String folder) {
+  String path = "/" + folder + "/index.txt";
+  File f = SD.open(path);
+  topicCount = 0;
+  if(!f) return;
+  
+  while(f.available() && topicCount < MAX_TOPICS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if(line.length() > 0) topics[topicCount++] = line;
+  }
+  f.close();
+}
+
+void loadTopicContent(String folder, int topicIndex) {
+  String path = "/" + folder + "/topic" + String(topicIndex + 1) + ".txt";
+  File f = SD.open(path);
+  lineCount = 0;
+  
+  if(!f) {
+    textLines[lineCount++] = "File not found";
+    return;
+  }
+  
+  while(f.available() && lineCount < MAX_LINES) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    
+    while(line.length() > 21 && lineCount < MAX_LINES) {
+      int wrap = 21;
+      for(int i = 21; i > 15; i--) {
+        if(i < line.length() && line.charAt(i) == ' ') {
+          wrap = i;
+          break;
+        }
+      }
+      textLines[lineCount++] = line.substring(0, wrap);
+      line = line.substring(wrap);
+      line.trim();
+    }
+    
+    if(line.length() > 0 && lineCount < MAX_LINES) {
+      textLines[lineCount++] = line;
+    }
+  }
+  f.close();
+}
+
+// ================= OTA SETUP =================
+void setupOTA() {
+  ArduinoOTA.setHostname("E-Reader");
+  ArduinoOTA.setPassword("12345678");
+  
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else {
+      type = "filesystem";
+    }
+    Serial.println("Start updating " + type);
+    display.clearDisplay();
+    display.setCursor(10, 20);
+    display.println("OTA Update");
+    display.setCursor(10, 35);
+    display.println("Updating...");
+    display.display();
+  });
+  
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+    display.clearDisplay();
+    display.setCursor(10, 20);
+    display.println("Update Complete!");
+    display.setCursor(10, 35);
+    display.println("Restarting...");
+    display.display();
+    delay(1000);
+  });
+  
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    int percent = (progress / (total / 100));
+    Serial.printf("Progress: %u%%\r", percent);
+    display.clearDisplay();
+    display.setCursor(10, 20);
+    display.println("OTA Progress");
+    display.setCursor(10, 35);
+    display.print(percent);
+    display.println("%");
+    display.display();
+  });
+  
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    display.clearDisplay();
+    display.setCursor(10, 20);
+    display.println("OTA Error!");
+    display.display();
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  
+  ArduinoOTA.begin();
+  Serial.println("OTA Ready");
+}
+
+// ================= AP MODE WITH OTA =================
+void setupAPMode() {
+  if(apEnabled) return;
+  
+  showMessage("Starting AP...", "FPV_CAM", "No password");
+  
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
+  apEnabled = true;
+  
+  setupOTA();
+  setupWebServer();
+  
+  resetActivityTimer();
+  
+  display.clearDisplay();
+  display.setCursor(5, 5);
+  display.println("AP Mode Active");
+  display.setCursor(5, 18);
+  display.println("SSID: FPV_CAM");
+  display.setCursor(5, 31);
+  display.println("IP: 192.168.4.1");
+  display.setCursor(5, 44);
+  display.println("OTA: E-Reader");
+  display.setCursor(5, 57);
+  display.println("BACK to exit");
+  display.display();
+  delay(2000);
+}
+
+void stopAPMode() {
+  if(!apEnabled) return;
+  ArduinoOTA.end();
+  WiFi.softAPdisconnect(true);
+  apEnabled = false;
+  WiFi.mode(WIFI_OFF);
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, []() {
+    String html = "<!DOCTYPE html><html>";
+    html += "<head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<title>E-Reader Manager</title>";
+    html += "<style>";
+    html += "body{font-family:Arial;background:#f0f0f0;margin:0;padding:20px}";
+    html += ".container{max-width:800px;margin:auto}";
+    html += ".card{background:white;border-radius:10px;padding:20px;margin-bottom:20px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}";
+    html += "h2{color:#333;margin-top:0}";
+    html += "h3{color:#667eea;margin:15px 0 10px 0}";
+    html += "button{background:#4CAF50;color:white;padding:8px 15px;border:none;border-radius:5px;cursor:pointer;margin:5px}";
+    html += "button:hover{background:#45a049}";
+    html += ".edit-btn{background:#2196F3}";
+    html += ".edit-btn:hover{background:#0b7dda}";
+    html += ".topic-item{display:flex;justify-content:space-between;align-items:center;padding:8px;margin:5px 0;background:#f9f9f9;border-radius:5px}";
+    html += ".topic-name{flex-grow:1}";
+    html += ".topic-actions button{margin-left:5px;padding:5px 10px;font-size:12px}";
+    html += ".rename-topic{background:#ff9800}";
+    html += ".rename-topic:hover{background:#e68900}";
+    html += ".rename-chapter{background:#ff9800;margin-bottom:10px}";
+    html += ".ota-btn{background:#9c27b0;margin-top:20px}";
+    html += ".ota-btn:hover{background:#7b1fa2}";
+    html += ".reset-btn{background:#f44336;margin-top:10px}";
+    html += ".reset-btn:hover{background:#d32f2f}";
+    html += "hr{margin:20px 0}";
+    html += "</style>";
+    html += "</head><body>";
+    html += "<div class='container'>";
+    html += "<div class='card'>";
+    html += "<h2>📚 E-Reader Manager</h2>";
+    html += "<p>Connected to: <strong>FPV_CAM</strong> | Edit your content below:</p>";
+    
+    // OTA Update section
+    html += "<div style='background:#f3e5f5;padding:15px;border-radius:10px;margin-bottom:20px'>";
+    html += "<h3 style='color:#9c27b0'>🔄 OTA Wireless Update</h3>";
+    html += "<p>Upload new firmware via Arduino IDE:</p>";
+    html += "<ol>";
+    html += "<li>In Arduino IDE: Tools → Port → Network ports</li>";
+    html += "<li>Select 'E-Reader at 192.168.4.1'</li>";
+    html += "<li>Password: 12345678</li>";
+    html += "<li>Click Upload (Sketch → Upload)</li>";
+    html += "</ol>";
+    html += "<button class='reset-btn' onclick='resetDevice()'>🔄 Reset ESP32</button>";
+    html += "</div>";
+    
+    for(int i = 1; i <= MAX_CHAPTERS; i++) {
+      String chName = readChapterName(i);
+      html += "<div style='border-left:4px solid #667eea;padding-left:15px;margin:20px 0'>";
+      html += "<h3>📖 Chapter " + String(i) + ": " + chName + "</h3>";
+      
+      html += "<button class='rename-chapter' onclick='editChapter(" + String(i) + ",\"" + chName + "\")'>✏️ Rename Chapter</button>";
+      
+      html += "<div style='margin-top:15px'>";
+      html += "<strong>Topics:</strong>";
+      for(int t = 1; t <= MAX_TOPICS; t++) {
+        String tpName = readTopicName(i, t);
+        html += "<div class='topic-item'>";
+        html += "<span class='topic-name'>📄 " + tpName + "</span>";
+        html += "<div class='topic-actions'>";
+        html += "<button class='rename-topic' onclick='editTopic(" + String(i) + "," + String(t) + ",\"" + tpName + "\")'>✏️ Rename</button>";
+        html += "<button class='edit-btn' onclick='editContent(" + String(i) + "," + String(t) + ")'>📝 Edit Content</button>";
+        html += "</div>";
+        html += "</div>";
+      }
+      html += "</div>";
+      html += "</div>";
+      html += "<hr>";
+    }
+    
+    html += "</div></div>";
+    
+    html += "<script>";
+    html += "function editChapter(chapterNum, currentName){";
+    html += "  var newName = prompt('Edit Chapter ' + chapterNum + ' name:', currentName);";
+    html += "  if(newName && newName != currentName){";
+    html += "    fetch('/rename_chapter?chapter=' + chapterNum + '&name=' + encodeURIComponent(newName))";
+    html += "    .then(response => response.text())";
+    html += "    .then(() => location.reload());";
+    html += "  }";
+    html += "}";
+    html += "function editTopic(chapterNum, topicNum, currentName){";
+    html += "  var newName = prompt('Edit Topic name:', currentName);";
+    html += "  if(newName && newName != currentName){";
+    html += "    fetch('/rename_topic?chapter=' + chapterNum + '&topic=' + topicNum + '&name=' + encodeURIComponent(newName))";
+    html += "    .then(response => response.text())";
+    html += "    .then(() => location.reload());";
+    html += "  }";
+    html += "}";
+    html += "function editContent(chapterNum, topicNum){";
+    html += "  window.location.href = '/edit_content?chapter=' + chapterNum + '&topic=' + topicNum;";
+    html += "}";
+    html += "function resetDevice(){";
+    html += "  if(confirm('Reset ESP32? This will restart the device.')){";
+    html += "    fetch('/reset').then(() => { alert('Resetting...'); });";
+    html += "  }";
+    html += "}";
+    html += "</script>";
+    
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+  
+  // Reset endpoint
+  server.on("/reset", HTTP_GET, []() {
+    server.send(200, "text/plain", "Resetting...");
+    delay(100);
+    softwareReset();
+  });
+  
+  // Edit content page
+  server.on("/edit_content", HTTP_GET, []() {
+    int ch = server.arg("chapter").toInt();
+    int tp = server.arg("topic").toInt();
+    String content = readTopicContent(ch, tp);
+    String topicName = readTopicName(ch, tp);
+    String chapterName = readChapterName(ch);
+    
+    String html = "<!DOCTYPE html><html>";
+    html += "<head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<title>Edit Content</title>";
+    html += "<style>";
+    html += "body{font-family:Arial;background:#f0f0f0;margin:0;padding:20px}";
+    html += ".container{max-width:800px;margin:auto}";
+    html += ".card{background:white;border-radius:10px;padding:20px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}";
+    html += "h2{color:#333}";
+    html += ".info{background:#e3f2fd;padding:15px;border-radius:5px;margin:20px 0}";
+    html += "textarea{width:100%;height:400px;padding:10px;font-family:monospace;font-size:14px;border:1px solid #ddd;border-radius:5px;margin:20px 0}";
+    html += "button{background:#4CAF50;color:white;padding:12px 30px;border:none;border-radius:5px;cursor:pointer;font-size:16px}";
+    html += "button:hover{background:#45a049}";
+    html += ".back-btn{background:#666;margin-left:10px}";
+    html += ".back-btn:hover{background:#555}";
+    html += "</style>";
+    html += "</head><body>";
+    html += "<div class='container'>";
+    html += "<div class='card'>";
+    html += "<h2>✏️ Edit Content</h2>";
+    html += "<div class='info'>";
+    html += "<strong>Chapter:</strong> " + chapterName + "<br>";
+    html += "<strong>Topic:</strong> " + topicName;
+    html += "</div>";
+    html += "<form method='POST' action='/save_content'>";
+    html += "<input type='hidden' name='chapter' value='" + String(ch) + "'>";
+    html += "<input type='hidden' name='topic' value='" + String(tp) + "'>";
+    html += "<textarea name='content'>" + content + "</textarea><br>";
+    html += "<button type='submit'>💾 Save Changes</button>";
+    html += "<button type='button' class='back-btn' onclick='window.location.href=\"/\"'>⬅ Back</button>";
+    html += "</form>";
+    html += "</div></div></body></html>";
+    server.send(200, "text/html", html);
+  });
+  
+  // Save content
+  server.on("/save_content", HTTP_POST, []() {
+    int ch = server.arg("chapter").toInt();
+    int tp = server.arg("topic").toInt();
+    String content = server.arg("content");
+    
+    if(saveTopicContent(ch, tp, content)) {
+      String html = "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='2;url=/'></head>";
+      html += "<body style='font-family:Arial;text-align:center;padding:50px'>";
+      html += "<h2>✅ Content Saved Successfully!</h2>";
+      html += "<p>Redirecting to main page...</p>";
+      html += "</body></html>";
+      server.send(200, "text/html", html);
+    } else {
+      server.send(500, "text/plain", "Error saving content");
+    }
+  });
+  
+  // Rename chapter
+  server.on("/rename_chapter", HTTP_GET, []() {
+    int ch = server.arg("chapter").toInt();
+    String newName = server.arg("name");
+    
+    if(renameChapter(ch, newName)) {
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(500, "text/plain", "Error");
+    }
+  });
+  
+  // Rename topic
+  server.on("/rename_topic", HTTP_GET, []() {
+    int ch = server.arg("chapter").toInt();
+    int tp = server.arg("topic").toInt();
+    String newName = server.arg("name");
+    
+    if(renameTopic(ch, tp, newName)) {
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(500, "text/plain", "Error");
+    }
+  });
+  
+  server.begin();
+  Serial.println("Web server started at 192.168.4.1");
+}
+
+String readChapterName(int ch) {
+  File f = SD.open("/index.txt");
+  String line = "";
+  for(int i = 1; i <= ch; i++) {
+    if(f.available()) line = f.readStringUntil('\n');
+  }
+  f.close();
+  line.trim();
+  if(line == "") line = "Chapter " + String(ch);
+  return line;
+}
+
+String readTopicName(int ch, int topic) {
+  String path = "/ch" + String(ch) + "/index.txt";
+  File f = SD.open(path);
+  String line = "";
+  for(int i = 1; i <= topic; i++) {
+    if(f.available()) line = f.readStringUntil('\n');
+  }
+  f.close();
+  line.trim();
+  if(line == "") line = "Topic " + String(topic);
+  return line;
+}
+
+String readTopicContent(int ch, int topic) {
+  String path = "/ch" + String(ch) + "/topic" + String(topic) + ".txt";
+  File f = SD.open(path);
+  String content = "";
+  while(f.available()) content += (char)f.read();
+  f.close();
+  if(content == "") content = "No content yet.";
+  return content;
+}
+
+bool saveTopicContent(int ch, int topic, String content) {
+  String path = "/ch" + String(ch) + "/topic" + String(topic) + ".txt";
+  if(SD.exists(path)) SD.remove(path);
+  File f = SD.open(path, FILE_WRITE);
+  if(!f) return false;
+  f.print(content);
+  f.close();
+  return true;
+}
+
+bool renameChapter(int ch, String newName) {
+  String allChapters[MAX_CHAPTERS];
+  File f = SD.open("/index.txt");
+  for(int i = 0; i < MAX_CHAPTERS; i++) {
+    if(f.available()) allChapters[i] = f.readStringUntil('\n');
+    else allChapters[i] = "Chapter " + String(i+1);
+    allChapters[i].trim();
+  }
+  f.close();
+  
+  allChapters[ch-1] = newName;
+  
+  SD.remove("/index.txt");
+  File wf = SD.open("/index.txt", FILE_WRITE);
+  for(int i = 0; i < MAX_CHAPTERS; i++) {
+    wf.println(allChapters[i]);
+  }
+  wf.close();
+  
+  loadChapters();
+  return true;
+}
+
+bool renameTopic(int ch, int topic, String newName) {
+  String path = "/ch" + String(ch) + "/index.txt";
+  
+  String allTopics[MAX_TOPICS];
+  File f = SD.open(path);
+  for(int i = 0; i < MAX_TOPICS; i++) {
+    if(f.available()) allTopics[i] = f.readStringUntil('\n');
+    else allTopics[i] = "Topic " + String(i+1);
+    allTopics[i].trim();
+  }
+  f.close();
+  
+  allTopics[topic - 1] = newName;
+  
+  SD.remove(path);
+  File wf = SD.open(path, FILE_WRITE);
+  for(int i = 0; i < MAX_TOPICS; i++) {
+    wf.println(allTopics[i]);
+  }
+  wf.close();
+  
+  if (currentMode == MODE_READER && currentFolder == ("ch" + String(ch))) {
+    loadTopics(currentFolder);
+  }
+  
+  return true;
+}
+
+void handleWebRequests() {
+  if(apEnabled) {
+    server.handleClient();
+    ArduinoOTA.handle();
+  }
+}
+
+// ================= BUTTON HANDLING =================
+void handleButtons() {
+  unsigned long now = millis();
+  if(now - lastButtonTime < DEBOUNCE_DELAY) return;
+  
+  bool upPressed = (digitalRead(BTN_UP) == LOW);
+  bool downPressed = (digitalRead(BTN_DOWN) == LOW);
+  bool selectPressed = (digitalRead(BTN_SELECT) == LOW);
+  bool backPressed = (digitalRead(BTN_BACK) == LOW);
+  
+  if (upPressed || downPressed || selectPressed || backPressed) {
+    resetActivityTimer();
+  }
+  
+  // ENTER READER MODE: SELECT + UP together (from watch mode)
+  if(selectPressed && upPressed && !downPressed && !backPressed && !readerModeActive && currentMode == MODE_WATCH) {
+    lastButtonTime = now;
+    if(sdCardMounted) {
+      enterReaderMode();
+    } else {
+      showPopup("No SD Card!", 1000);
+    }
+    return;
+  }
+  
+  // EXIT TO WATCH MODE: SELECT + BACK together
+  if(currentMode == MODE_READER && selectPressed && backPressed && !upPressed && !downPressed) {
+    lastButtonTime = now;
+    exitToWatchMode();
+    return;
+  }
+  
+  // MANUAL SLEEP: UP + BACK together
+  if(currentMode == MODE_WATCH && upPressed && backPressed && !downPressed && !selectPressed) {
+    lastButtonTime = now;
+    goToDeepSleep();
+    return;
+  }
+  
+  // Handle navigation in different modes
+  if(currentMode == MODE_WATCH) {
+    // Only combo buttons work
+  } 
+  else if(currentMode == MODE_READER) {
+    if(upPressed && !downPressed && !selectPressed && !backPressed) {
+      lastButtonTime = now;
+      switch(readerScreen) {
+        case SCR_READER_MAIN:
+          if(readerCursor > 0) readerCursor--;
+          break;
+        case SCR_READER_CHAPTERS:
+          if(selectedChapter > 0) selectedChapter--;
+          break;
+        case SCR_READER_TOPICS:
+          if(selectedTopic > 0) selectedTopic--;
+          break;
+        case SCR_READER_READ:
+          if(scrollPosition > 0) scrollPosition--;
+          break;
+      }
+      displayReaderMenu();
+    }
+    else if(downPressed && !upPressed && !selectPressed && !backPressed) {
+      lastButtonTime = now;
+      switch(readerScreen) {
+        case SCR_READER_MAIN:
+          if(readerCursor < 2) readerCursor++;
+          break;
+        case SCR_READER_CHAPTERS:
+          if(selectedChapter < chapterCount - 1) selectedChapter++;
+          break;
+        case SCR_READER_TOPICS:
+          if(selectedTopic < topicCount - 1) selectedTopic++;
+          break;
+        case SCR_READER_READ:
+          if(scrollPosition + LINES_PER_SCREEN < lineCount) scrollPosition++;
+          break;
+      }
+      displayReaderMenu();
+    }
+    else if(selectPressed && !upPressed && !downPressed && !backPressed) {
+      lastButtonTime = now;
+      if(readerScreen == SCR_READER_MAIN) {
+        if(readerCursor == 0) {
+          readerScreen = SCR_READER_CHAPTERS;
+          selectedChapter = 0;
+          displayReaderMenu();
+        } else if(readerCursor == 1) {
+          currentMode = MODE_AP;
+          setupAPMode();
+        } else if(readerCursor == 2) {
+          exitToWatchMode();
+        }
+      } 
+      else if(readerScreen == SCR_READER_CHAPTERS) {
+        currentFolder = "ch" + String(selectedChapter + 1);
+        currentChapterName = chapters[selectedChapter];
+        loadTopics(currentFolder);
+        readerScreen = SCR_READER_TOPICS;
+        selectedTopic = 0;
+        displayReaderMenu();
+      } 
+      else if(readerScreen == SCR_READER_TOPICS) {
+        loadTopicContent(currentFolder, selectedTopic);
+        readerScreen = SCR_READER_READ;
+        scrollPosition = 0;
+        displayReaderMenu();
+      }
+    }
+    else if(backPressed && !upPressed && !downPressed && !selectPressed) {
+      lastButtonTime = now;
+      if(readerScreen == SCR_READER_MAIN) {
+        exitToWatchMode();
+      } else if(readerScreen == SCR_READER_CHAPTERS) {
+        readerScreen = SCR_READER_MAIN;
+        readerCursor = 0;
+        displayReaderMenu();
+      } else if(readerScreen == SCR_READER_TOPICS) {
+        readerScreen = SCR_READER_CHAPTERS;
+        selectedChapter = 0;
+        displayReaderMenu();
+      } else if(readerScreen == SCR_READER_READ) {
+        readerScreen = SCR_READER_TOPICS;
+        selectedTopic = 0;
+        scrollPosition = 0;
+        displayReaderMenu();
+      }
+    }
+  }
+  else if(currentMode == MODE_AP) {
+    if(apEnabled) {
+      handleWebRequests();
+    }
+    if(backPressed && !upPressed && !downPressed && !selectPressed) {
+      lastButtonTime = now;
+      stopAPMode();
+      exitToWatchMode();
+    }
+  }
+  else if(currentMode == MODE_SETTINGS) {
+    if(upPressed && !downPressed && !selectPressed && !backPressed) {
+      lastButtonTime = now;
+      if(brightnessLevel < 100) brightnessLevel += 10;
+      brightness = map(brightnessLevel, 0, 100, 0, 255);
+      setBrightness(brightness);
+      displaySettingsMain();
+    }
+    else if(downPressed && !upPressed && !selectPressed && !backPressed) {
+      lastButtonTime = now;
+      if(brightnessLevel > 0) brightnessLevel -= 10;
+      brightness = map(brightnessLevel, 0, 100, 0, 255);
+      setBrightness(brightness);
+      displaySettingsMain();
+    }
+    else if(backPressed && !upPressed && !downPressed && !selectPressed) {
+      lastButtonTime = now;
+      exitToWatchMode();
+    }
+  }
+}
+
+// ================= DISPLAY FUNCTIONS =================
+void displayReaderMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  switch(readerScreen) {
+    case SCR_READER_MAIN:
+      {
+        const char* items[] = {"Start Reading", "AP Mode (WiFi)", "Exit to Watch"};
+        display.setCursor(0, 0);
+        display.println("E-Reader");
+        display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+        for(int i = 0; i < 3; i++) {
+          display.setCursor(0, 20 + i * 10);
+          if(i == readerCursor) {
+            display.print("> ");
+            display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+            display.print(items[i]);
+            display.setTextColor(SSD1306_WHITE);
+          } else {
+            display.print("  ");
+            display.print(items[i]);
+          }
+        }
+      }
+      break;
+      
+    case SCR_READER_CHAPTERS:
+      displayChapters();
+      break;
+      
+    case SCR_READER_TOPICS:
+      displayTopics();
+      break;
+      
+    case SCR_READER_READ:
+      displayText();
+      break;
+  }
+  
+  display.display();
+}
+
+void displayChapters() {
+  display.setCursor(0, 0);
+  display.println("Chapters");
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  
+  if(selectedChapter < readerScrollTop) readerScrollTop = selectedChapter;
+  if(selectedChapter >= readerScrollTop + VISIBLE_ITEMS) readerScrollTop = selectedChapter - VISIBLE_ITEMS + 1;
+  
+  for(int i = 0; i < VISIBLE_ITEMS; i++) {
+    int idx = readerScrollTop + i;
+    if(idx >= chapterCount) break;
+    int y = 14 + i * 10;
+    
+    String txt = chapters[idx];
+    if(txt.length() > 16) txt = txt.substring(0, 13) + "...";
+    
+    if(idx == selectedChapter) {
+      display.fillRect(0, y-1, 128, 10, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(2, y);
+      display.print("> ");
+      display.print(txt);
+      display.setTextColor(SSD1306_WHITE);
+    } else {
+      display.setCursor(2, y);
+      display.print("  ");
+      display.print(txt);
+    }
+  }
+  
+  display.setCursor(0, 54);
+  display.print(selectedChapter+1);
+  display.print("/");
+  display.print(chapterCount);
+}
+
+void displayTopics() {
+  display.setCursor(0, 0);
+  String title = currentChapterName;
+  if(title.length() > 16) title = title.substring(0, 13) + "...";
+  display.print(title);
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  
+  if(selectedTopic < readerScrollTop) readerScrollTop = selectedTopic;
+  if(selectedTopic >= readerScrollTop + VISIBLE_ITEMS) readerScrollTop = selectedTopic - VISIBLE_ITEMS + 1;
+  
+  for(int i = 0; i < VISIBLE_ITEMS; i++) {
+    int idx = readerScrollTop + i;
+    if(idx >= topicCount) break;
+    int y = 14 + i * 10;
+    
+    String txt = topics[idx];
+    if(txt.length() > 16) txt = txt.substring(0, 13) + "...";
+    
+    if(idx == selectedTopic) {
+      display.fillRect(0, y-1, 128, 10, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(2, y);
+      display.print("> ");
+      display.print(txt);
+      display.setTextColor(SSD1306_WHITE);
+    } else {
+      display.setCursor(2, y);
+      display.print("  ");
+      display.print(txt);
+    }
+  }
+  
+  display.setCursor(0, 54);
+  display.print(selectedTopic+1);
+  display.print("/");
+  display.print(topicCount);
+}
+
+void displayText() {
+  int startLine = scrollPosition;
+  if(startLine < 0) startLine = 0;
+  if(startLine >= lineCount) startLine = lineCount - LINES_PER_SCREEN;
+  if(startLine < 0) startLine = 0;
+  
+  for(int i = 0; i < LINES_PER_SCREEN; i++) {
+    int lineIndex = startLine + i;
+    if(lineIndex >= lineCount) break;
+    
+    display.setCursor(0, i * 8);
+    String line = textLines[lineIndex];
+    if(line.length() > 21) line = line.substring(0, 18) + "..";
+    display.println(line);
+  }
+}
+
+void displayAPMain() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("AP Mode");
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  
+  if(apEnabled) {
+    display.setCursor(15, 18);
+    display.println("WiFi ACTIVE");
+    display.setCursor(15, 30);
+    display.println("FPV_CAM");
+    display.setCursor(15, 42);
+    display.println("OTA Ready");
+    display.setCursor(5, 55);
+    display.println("BACK to exit");
+  } else {
+    display.setCursor(20, 25);
+    display.println("Starting...");
+  }
+  display.display();
+}
+
+void displaySettingsMain() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Settings");
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  
+  display.setCursor(0, 25);
+  display.print("Brightness: ");
+  display.print(brightnessLevel);
+  display.print("%");
+  
+  int barWidth = map(brightnessLevel, 0, 100, 0, 100);
+  display.drawRect(0, 40, 100, 8, SSD1306_WHITE);
+  display.fillRect(1, 41, barWidth, 6, SSD1306_WHITE);
+  
+  display.setCursor(0, 55);
+  display.print("UP/DOWN to adjust");
+  display.display();
+}
+
+void displayWatchFace() {
+  updateInternalRTC();
+  
+  display.clearDisplay();
+  
+  String timeStr;
+  if(hours < 10) timeStr = "0" + String(hours);
+  else timeStr = String(hours);
+  timeStr += ":";
+  if(minutes < 10) timeStr += "0" + String(minutes);
+  else timeStr += String(minutes);
+  
+  String dateStr = getWeekDayString(weekDay) + " ";
+  if(day < 10) dateStr += "0";
+  dateStr += String(day) + "/";
+  if(month < 10) dateStr += "0";
+  dateStr += String(month);
+  
+  display.setTextSize(3);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
+  int centerX_time = (SCREEN_WIDTH - w) / 2;
+  int centerY_time = 20;
+  display.setCursor(centerX_time, centerY_time);
+  display.print(timeStr);
+  
+  display.setTextSize(1);
+  display.getTextBounds(dateStr, 0, 0, &x1, &y1, &w, &h);
+  int centerX_date = (SCREEN_WIDTH - w) / 2;
+  int centerY_date = 52;
+  display.setCursor(centerX_date, centerY_date);
+  display.print(dateStr);
+  
+  display.display();
+}
+
+// ================= MAIN LOOP =================
+void loop() {
+  static unsigned long lastDisplay = 0;
+  
+  handleButtons();
+  
+  if (currentMode == MODE_WATCH) {
+    if (millis() - lastActivityTime >= WATCH_SLEEP_TIMEOUT_MS) {
+      goToDeepSleep();
+    }
+  }
+  
+  if(currentMode == MODE_WATCH) {
+    if(millis() - lastDisplay > 100) {
+      displayWatchFace();
+      lastDisplay = millis();
+    }
+  } 
+  else if(currentMode == MODE_READER) {
+    if(millis() - lastDisplay > 100) {
+      displayReaderMenu();
+      lastDisplay = millis();
+    }
+  }
+  else if(currentMode == MODE_AP) {
+    if(millis() - lastDisplay > 100) {
+      displayAPMain();
+      lastDisplay = millis();
+    }
+    if(apEnabled) {
+      server.handleClient();
+      ArduinoOTA.handle();
+    }
+  }
+  else if(currentMode == MODE_SETTINGS) {
+    if(millis() - lastDisplay > 100) {
+      displaySettingsMain();
+      lastDisplay = millis();
+    }
+  }
+  
+  delay(10);
+}
+
